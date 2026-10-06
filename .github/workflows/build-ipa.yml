@@ -1,0 +1,81 @@
+name: Build IPA (Xcode 26, unsigned)
+
+on:
+  push:
+    branches: [xcode26]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 需要装有 Xcode 26 的 macOS runner（iOS 26 工具链）。
+    # macos-latest 自带最新 Xcode；Select Xcode 步骤会自动挑最新的 Xcode*.app。
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          echo "== Available Xcodes =="
+          ls /Applications | grep -i xcode || true
+          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)
+          if [ -z "$XCODE" ]; then
+            echo "::error::未找到 Xcode，请更换 runner 镜像"
+            exit 1
+          fi
+          echo "Using: $XCODE"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Install CocoaPods
+        run: brew install cocoapods
+
+      - name: Pod install (重新生成适配 Xcode 26 的 Pods)
+        run: |
+          cd IpaDownloadTool
+          rm -rf Pods Podfile.lock
+          # 上游 Podfile 写的 platform :ios,'8.0'，Xcode 26 编不过，bump 到 15.0
+          sed -i '' "s/platform :ios, '8.0'/platform :ios, '15.0'/" Podfile
+          pod install --repo-update
+
+      - name: Build .app (unsigned)
+        run: |
+          set -eo pipefail
+          xcodebuild build \
+            -workspace IpaDownloadTool/IpaDownloadTool.xcworkspace \
+            -target IpaDownloadTool \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/build/dd" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            | tee build.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP=$(find "$PWD/build/dd/Build/Products" -name "IpaDownloadTool.app" -type d | head -n1)
+          if [ -z "$APP" ]; then
+            echo "::error::未找到 IpaDownloadTool.app，build 可能失败"
+            exit 1
+          fi
+          echo "Found app: $APP"
+          mkdir -p "$PWD/build/Payload"
+          cp -R "$APP" "$PWD/build/Payload/"
+          ( cd "$PWD/build" && zip -r IpaDownloadTool.ipa Payload )
+          echo "== IPA 大小 =="
+          ls -lh "$PWD/build/IpaDownloadTool.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IpaDownloadTool-unsigned-ipa
+          path: build/IpaDownloadTool.ipa
+          if-no-files-found: error
